@@ -7,30 +7,50 @@ def get_blob_list(blob_service_client, container_name, prefix=""):
     blobs = container_client.list_blobs(name_starts_with=prefix)
     return sorted([blob.name for blob in blobs])
 
-def get_last_copied_file(blob_service_client, container_name):
-    """Get the last copied file from the tracking blob."""
+def get_last_copied_file(blob_service_client, container_name, tracker_path):
+    """Get the last copied file from the tracking blob.
+    Args:
+        blob_service_client: Azure blob service client
+        container_name: Name of the container
+        tracker_path: Full path to the tracker file within the container (e.g. 'stem/copy_tracker.json')
+    """
     try:
         container_client = blob_service_client.get_container_client(container_name)
-        blob_client = container_client.get_blob_client("copy_tracker.json")
+        blob_client = container_client.get_blob_client(tracker_path)
         tracker_content = blob_client.download_blob().readall()
         return json.loads(tracker_content)["last_copied_file"]
-    except Exception:
+    except Exception as e:
+        if "BlobNotFound" in str(e):
+            print(f"No {tracker_path} found. Will create it after first file copy.")
+        else:
+            print(f"Error reading {tracker_path}: {e}")
         return None
 
-def update_last_copied_file(blob_service_client, container_name, last_file):
-    """Update the tracking blob with the last copied file."""
-    container_client = blob_service_client.get_container_client(container_name)
-    blob_client = container_client.get_blob_client("copy_tracker.json")
-    tracker_content = json.dumps({"last_copied_file": last_file})
-    blob_client.upload_blob(tracker_content, overwrite=True)
+def update_last_copied_file(blob_service_client, container_name, last_file, tracker_path):
+    """Update the tracking blob with the last copied file.
+    Args:
+        blob_service_client: Azure blob service client
+        container_name: Name of the container
+        last_file: Path of the last copied file
+        tracker_path: Full path to the tracker file within the container (e.g. 'stem/copy_tracker.json')
+    """
+    try:
+        container_client = blob_service_client.get_container_client(container_name)
+        blob_client = container_client.get_blob_client(tracker_path)
+        tracker_content = json.dumps({"last_copied_file": last_file})
+        blob_client.upload_blob(tracker_content, overwrite=True)
+        print(f"Successfully updated {tracker_path} with last copied file: {last_file}")
+    except Exception as e:
+        print(f"Error updating {tracker_path}: {e}")
+        raise
 
-def get_next_blob_to_copy(blob_service_client, container_name, prefix=""):
+def get_next_blob_to_copy(blob_service_client, container_name, prefix="", tracker_path="copy_tracker.json"):
     """Get the next blob that needs to be copied."""
     all_blobs = get_blob_list(blob_service_client, container_name, prefix)
     if not all_blobs:
         return None
         
-    last_copied = get_last_copied_file(blob_service_client, container_name)
+    last_copied = get_last_copied_file(blob_service_client, container_name, tracker_path)
     
     if last_copied is None:
         return all_blobs[0]
@@ -92,6 +112,7 @@ if __name__ == "__main__":
     target_account_key = "your-target-key"
     target_container = "target-container"
     target_folder = "target-folder/"  # Specify your target folder prefix here
+    tracker_path = "stem/copy_tracker.json"  # Specify the path to your tracker file
 
     # Create source blob service client
     source_blob_service_client = BlobServiceClient(
@@ -100,7 +121,12 @@ if __name__ == "__main__":
     )
 
     # Get the next blob to copy
-    source_blob_path = get_next_blob_to_copy(source_blob_service_client, source_container, source_folder)
+    source_blob_path = get_next_blob_to_copy(
+        source_blob_service_client, 
+        source_container, 
+        source_folder,
+        tracker_path
+    )
     
     if source_blob_path:
         # Construct target blob path
@@ -117,6 +143,11 @@ if __name__ == "__main__":
             account_url=f"https://{target_account_name}.blob.core.windows.net",
             credential=target_account_key
         )
-        update_last_copied_file(target_blob_service_client, target_container, source_blob_path)
+        update_last_copied_file(
+            target_blob_service_client, 
+            target_container, 
+            source_blob_path,
+            tracker_path
+        )
     else:
         print("No new files to copy")
