@@ -2,6 +2,7 @@ from azure.storage.blob import BlobServiceClient
 import json
 import logging
 from datetime import datetime
+import os.path
 
 # Configure logging
 logging.basicConfig(
@@ -17,7 +18,8 @@ def get_blob_list(blob_service_client, container_name, prefix=""):
     try:
         container_client = blob_service_client.get_container_client(container_name)
         blobs = container_client.list_blobs(name_starts_with=prefix)
-        blob_list = sorted([blob.name for blob in blobs])
+        # Filter blobs that have a file extension
+        blob_list = sorted([blob.name for blob in blobs if os.path.splitext(blob.name)[1] != ''])
         logger.info(f"Found {len(blob_list)} blobs")
         logger.debug(f"Blob list: {blob_list}")
         return blob_list
