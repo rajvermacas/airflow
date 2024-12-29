@@ -13,175 +13,198 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Define file categories - Add new categories here
+# Define file categories
 FILE_CATEGORIES = {
     'abc': {
         'prefix': 'abc_',
-        'tracker_key': 'last_copied_abc'
+        'tracker_key': 'last_copied_abc',
+        'data_extension': '.txt'
     },
     'edf': {
         'prefix': 'edf_',
-        'tracker_key': 'last_copied_edf'
+        'tracker_key': 'last_copied_edf',
+        'data_extension': '.txt'
     }
-    # Add new categories here like:
-    # 'xyz': {
-    #     'prefix': 'xyz_',
-    #     'tracker_key': 'last_copied_xyz'
-    # }
 }
 
-def get_category_blobs(blob_service_client, container_name, prefix: str, category_prefix: str) -> List[str]:
-    """List all blobs for a specific category."""
-    logger.info(f"Listing blobs for prefix '{prefix + category_prefix}'")
+def get_data_files(blob_service_client, container_name: str, prefix: str, category_prefix: str, 
+                   data_extension: str) -> List[str]:
+    """Get list of data files (excluding CTL files) for a category."""
     try:
         container_client = blob_service_client.get_container_client(container_name)
-        blobs = container_client.list_blobs(name_starts_with=prefix + category_prefix)
-        # Filter and sort files with extensions
-        files = sorted([blob.name for blob in blobs if os.path.splitext(blob.name)[1] != ''])
-        logger.info(f"Found {len(files)} files")
-        logger.debug(f"Files: {files}")
-        return files
+        full_prefix = prefix + category_prefix
+        logger.info(f"Listing data files with prefix: {full_prefix}")
+        
+        # List blobs and filter for data files
+        blobs = container_client.list_blobs(name_starts_with=full_prefix)
+        data_files = sorted([
+            blob.name for blob in blobs 
+            if blob.name.endswith(data_extension)
+        ])
+        
+        logger.info(f"Found {len(data_files)} data files")
+        logger.debug(f"Data files: {data_files}")
+        return data_files
     except Exception as e:
-        logger.error(f"Error listing blobs: {str(e)}")
+        logger.error(f"Error listing data files: {str(e)}")
         raise
 
-def process_category(
-    category: str,
-    config: dict,
-    source_client: BlobServiceClient,
-    target_client: BlobServiceClient,
-    source_container: str,
-    target_container: str,
-    source_prefix: str,
-    target_prefix: str,
-    tracker_path: str
-) -> Optional[str]:
-    """Process a single category of files."""
-    logger.info(f"Processing category: {category}")
-    
-    # Get files for this category
-    files = get_category_blobs(source_client, source_container, source_prefix, config['prefix'])
-    if not files:
-        logger.info(f"No files found for category {category}")
-        return None
-        
-    # Get last copied file for this category
+def get_last_copied_file(blob_service_client, container_name: str, tracker_path: str, 
+                        category: str) -> Optional[str]:
+    """Get last copied file for a specific category."""
     try:
-        container_client = target_client.get_container_client(target_container)
+        container_client = blob_service_client.get_container_client(container_name)
         blob_client = container_client.get_blob_client(tracker_path)
         tracker_content = blob_client.download_blob().readall()
         tracker_data = json.loads(tracker_content)
-        last_copied = tracker_data.get(config['tracker_key'])
-        logger.info(f"Last copied file for {category}: {last_copied}")
+        last_file = tracker_data.get(FILE_CATEGORIES[category]['tracker_key'])
+        logger.info(f"Last copied file for {category}: {last_file}")
+        return last_file
     except Exception as e:
         if "BlobNotFound" in str(e):
-            logger.warning(f"No {tracker_path} found. Starting from first file.")
-            last_copied = None
+            logger.warning(f"No {tracker_path} found. Will start from beginning.")
         else:
             logger.error(f"Error reading tracker: {str(e)}")
-            raise
+        return None
+
+def update_tracker(blob_service_client, container_name: str, tracker_path: str,
+                  category: str, copied_file: str):
+    """Update tracker for a specific category."""
+    try:
+        container_client = blob_service_client.get_container_client(container_name)
+        blob_client = container_client.get_blob_client(tracker_path)
+        
+        # Try to get existing tracker content
+        try:
+            tracker_content = json.loads(blob_client.download_blob().readall())
+        except Exception:
+            tracker_content = {}
+        
+        # Update tracker with new file and timestamp
+        tracker_content[FILE_CATEGORIES[category]['tracker_key']] = copied_file
+        tracker_content['last_updated'] = datetime.utcnow().isoformat()
+        
+        # Upload updated tracker
+        blob_client.upload_blob(json.dumps(tracker_content), overwrite=True)
+        logger.info(f"Updated tracker for {category} with file: {copied_file}")
+    except Exception as e:
+        logger.error(f"Error updating tracker: {str(e)}")
+        raise
+
+def copy_files(source_client: BlobServiceClient, target_client: BlobServiceClient,
+               source_container: str, target_container: str,
+               source_data_path: str, target_folder: str) -> bool:
+    """Copy both data and CTL files."""
+    try:
+        # Generate file paths
+        source_ctl_path = os.path.splitext(source_data_path)[0] + '.ctl'
+        target_data_path = target_folder + os.path.basename(source_data_path)
+        target_ctl_path = target_folder + os.path.basename(source_ctl_path)
+        
+        # Check if CTL file exists
+        source_container_client = source_client.get_container_client(source_container)
+        if not source_container_client.get_blob_client(source_ctl_path).exists():
+            logger.error(f"CTL file not found: {source_ctl_path}")
+            return False
+        
+        # Copy data file
+        logger.info(f"Copying data file: {source_data_path}")
+        source_data_client = source_client.get_blob_client(source_container, source_data_path)
+        target_data_client = target_client.get_blob_client(target_container, target_data_path)
+        data_copy = target_data_client.start_copy_from_url(source_data_client.url)
+        
+        # Copy CTL file
+        logger.info(f"Copying CTL file: {source_ctl_path}")
+        source_ctl_client = source_client.get_blob_client(source_container, source_ctl_path)
+        target_ctl_client = target_client.get_blob_client(target_container, target_ctl_path)
+        ctl_copy = target_ctl_client.start_copy_from_url(source_ctl_client.url)
+        
+        # Wait for copies to complete
+        data_prop = target_data_client.get_blob_properties()
+        ctl_prop = target_ctl_client.get_blob_properties()
+        
+        while data_prop.copy.status == 'pending' or ctl_prop.copy.status == 'pending':
+            data_prop = target_data_client.get_blob_properties()
+            ctl_prop = target_ctl_client.get_blob_properties()
+        
+        if data_prop.copy.status == 'success' and ctl_prop.copy.status == 'success':
+            logger.info("Successfully copied both data and CTL files")
+            return True
+        else:
+            logger.error(f"Copy failed. Data status: {data_prop.copy.status}, CTL status: {ctl_prop.copy.status}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error during file copy: {str(e)}")
+        return False
+
+def process_category(category: str, source_client: BlobServiceClient, target_client: BlobServiceClient,
+                    source_container: str, target_container: str,
+                    source_folder: str, target_folder: str, tracker_path: str) -> bool:
+    """Process files for a single category."""
+    logger.info(f"Processing category: {category}")
+    config = FILE_CATEGORIES[category]
+    
+    # Get list of data files
+    data_files = get_data_files(
+        source_client, 
+        source_container,
+        source_folder,
+        config['prefix'],
+        config['data_extension']
+    )
+    
+    if not data_files:
+        logger.info(f"No files found for category {category}")
+        return False
+    
+    # Get last copied file
+    last_copied = get_last_copied_file(
+        target_client,
+        target_container,
+        tracker_path,
+        category
+    )
     
     # Find next file to copy
     next_file = None
     if last_copied is None:
-        next_file = files[0]
-        logger.info(f"No previous file record found. Starting with: {next_file}")
+        next_file = data_files[0]
     else:
         try:
-            last_index = files.index(last_copied)
-            if last_index + 1 < len(files):
-                next_file = files[last_index + 1]
-                logger.info(f"Next file to copy: {next_file}")
+            last_index = data_files.index(last_copied)
+            if last_index + 1 < len(data_files):
+                next_file = data_files[last_index + 1]
         except ValueError:
-            next_file = files[0]
-            logger.warning(f"Last copied file '{last_copied}' not found. Starting from beginning.")
+            logger.warning(f"Last copied file not found in source. Starting from beginning.")
+            next_file = data_files[0]
     
-    if next_file:
-        # Copy the file
-        target_path = target_prefix + os.path.basename(next_file)
-        copy_file_server_side(
-            source_account_name, source_account_key, source_container, next_file,
-            target_account_name, target_account_key, target_container, target_path
-        )
-        logger.info(f"Successfully copied {category} file: {next_file}")
-        return next_file
+    if next_file is None:
+        logger.info(f"No new files to copy for category {category}")
+        return False
     
-    return None
-
-def update_last_copied_files(blob_service_client, container_name, copied_files: Dict[str, str], tracker_path):
-    """Update the tracking blob with the last copied files for all categories."""
-    logger.info(f"Updating tracker file '{tracker_path}' with copied files: {copied_files}")
-    try:
-        container_client = blob_service_client.get_container_client(container_name)
-        blob_client = container_client.get_blob_client(tracker_path)
-        
-        # Prepare tracker content
-        tracker_content = {
-            "last_updated": datetime.utcnow().isoformat()
-        }
-        # Add entry for each category
-        for category, config in FILE_CATEGORIES.items():
-            tracker_content[config['tracker_key']] = copied_files.get(category)
-        
-        blob_client.upload_blob(json.dumps(tracker_content), overwrite=True)
-        logger.info(f"Successfully updated {tracker_path}")
-    except Exception as e:
-        logger.error(f"Error updating {tracker_path}: {str(e)}")
-        raise
-
-def copy_file_server_side(source_account_name, source_account_key, source_container, source_blob_path,
-                          target_account_name, target_account_key, target_container, target_blob_path):
-    """Copy blob from source to target using server-side copy."""
-    logger.info(f"Starting server-side copy from '{source_blob_path}' to '{target_blob_path}'")
-    try:
-        # Create source BlobServiceClient
-        source_blob_service_client = BlobServiceClient(
-            account_url=f"https://{source_account_name}.blob.core.windows.net",
-            credential=source_account_key
+    # Copy files and update tracker
+    if copy_files(
+        source_client, target_client,
+        source_container, target_container,
+        next_file, target_folder
+    ):
+        update_tracker(
+            target_client,
+            target_container,
+            tracker_path,
+            category,
+            next_file
         )
-        
-        # Get the source blob URL
-        source_blob_client = source_blob_service_client.get_blob_client(source_container, source_blob_path)
-        source_blob_url = source_blob_client.url
-        logger.debug(f"Source blob URL: {source_blob_url}")
+        return True
+    
+    return False
 
-        # Create target BlobServiceClient
-        target_blob_service_client = BlobServiceClient(
-            account_url=f"https://{target_account_name}.blob.core.windows.net",
-            credential=target_account_key
-        )
-
-        # Get target blob client
-        target_blob_client = target_blob_service_client.get_blob_client(target_container, target_blob_path)
-
-        # Initiate server-side copy
-        copy_operation = target_blob_client.start_copy_from_url(source_blob_url)
-        logger.info("Copy operation started")
-
-        # Wait for the copy to complete
-        properties = target_blob_client.get_blob_properties()
-        while properties.copy.status == "pending":
-            logger.info(f"Copy operation in progress: {properties.copy.status}")
-            properties = target_blob_client.get_blob_properties()
-
-        logger.info(f"Copy operation completed with status: {properties.copy.status}")
-        
-        if properties.copy.status == "success":
-            logger.info(f"Successfully copied {source_blob_path} to {target_blob_path}")
-        else:
-            logger.error(f"Copy failed with status: {properties.copy.status}")
-            if properties.copy.status == "failed":
-                logger.error(f"Copy failed with error: {properties.copy.status_description}")
-
-    except Exception as e:
-        logger.error(f"Error during file copy: {str(e)}", exc_info=True)
-        raise
-
-# Example usage
-if __name__ == "__main__":
+def main():
     try:
         logger.info("Starting blob copy process")
         
+        # Configuration
         source_account_name = "your-source-account"
         source_account_key = "your-source-key"
         source_container = "source-container"
@@ -192,10 +215,8 @@ if __name__ == "__main__":
         target_container = "target-container"
         target_folder = "target-folder/"
         tracker_path = "stem/copy_tracker.json"
-
-        logger.info(f"Source: {source_account_name}/{source_container}/{source_folder}")
-        logger.info(f"Target: {target_account_name}/{target_container}/{target_folder}")
         
+        # Create clients
         source_client = BlobServiceClient(
             account_url=f"https://{source_account_name}.blob.core.windows.net",
             credential=source_account_key
@@ -205,50 +226,36 @@ if __name__ == "__main__":
             account_url=f"https://{target_account_name}.blob.core.windows.net",
             credential=target_account_key
         )
-
-        copied_files = {}
+        
+        # Process each category
         files_copied = False
-        
-        # Process each category sequentially
-        for category, config in FILE_CATEGORIES.items():
-            copied_file = process_category(
-                category=category,
-                config=config,
-                source_client=source_client,
-                target_client=target_client,
-                source_container=source_container,
-                target_container=target_container,
-                source_prefix=source_folder,
-                target_prefix=target_folder,
-                tracker_path=tracker_path
-            )
-            
-            if copied_file:
-                copied_files[category] = copied_file
-                files_copied = True
-            else:
-                # Get the last copied file for this category from tracker
-                try:
-                    container_client = target_client.get_container_client(target_container)
-                    blob_client = container_client.get_blob_client(tracker_path)
-                    tracker_content = blob_client.download_blob().readall()
-                    tracker_data = json.loads(tracker_content)
-                    copied_files[category] = tracker_data.get(config['tracker_key'])
-                except Exception:
-                    copied_files[category] = None
-        
-        # Update tracker if any files were copied
-        if files_copied:
-            update_last_copied_files(
-                target_client,
-                target_container,
-                copied_files,
+        for category in FILE_CATEGORIES:
+            if process_category(
+                category,
+                source_client, target_client,
+                source_container, target_container,
+                source_folder, target_folder,
                 tracker_path
-            )
-            logger.info("Blob copy process completed successfully")
+            ):
+                files_copied = True
+        
+        if files_copied:
+            logger.info("Successfully copied files from one or more categories")
         else:
             logger.info("No new files to copy in any category")
             
     except Exception as e:
         logger.error("Blob copy process failed", exc_info=True)
         raise
+
+if __name__ == "__main__":
+    """
+    Flow:
+        main
+            process_category
+                get_data_files
+                get_last_copied_file
+                copy_files
+                update_tracker
+    """
+    main()
