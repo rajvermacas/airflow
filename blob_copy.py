@@ -1,7 +1,7 @@
 from azure.storage.blob import BlobServiceClient
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import os.path
 from typing import Dict, List, Tuple, Optional
 
@@ -12,6 +12,32 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+# Define date formats
+DATE_FORMAT = {
+    'TRACKER': '%Y-%m-%d',      # Format for dates stored in tracker: 2025-01-26
+    'FILENAME': '%Y%m%d',       # Format for dates in filenames: 20250126
+    'LOGGING': '%Y-%m-%d',      # Format for dates in logs: 2025-01-26
+}
+
+# Define phases for data copying
+PHASES = [
+    {
+        'id': 1,
+        'start_date': '2025-01-01',
+        'end_date': '2025-01-26'  # Current date
+    },
+    {
+        'id': 2,
+        'start_date': '2024-12-01',
+        'end_date': '2024-12-31'
+    },
+    {
+        'id': 3,
+        'start_date': '2024-11-01',
+        'end_date': '2024-11-30'
+    }
+]
 
 # Define file categories
 FILE_CATEGORIES = {
@@ -27,49 +53,147 @@ FILE_CATEGORIES = {
     }
 }
 
+def extract_date_from_filename(filename: str) -> str:
+    """
+    Extract date from filename and return in tracker format.
+    Assumes filename contains date in FILENAME format.
+    """
+    try:
+        # Extract the date part from filename
+        date_str = next(part for part in os.path.basename(filename).split('_') 
+                       if len(part) == 8 and part.isdigit())
+        # Convert from filename format to tracker format
+        date_obj = datetime.strptime(date_str, DATE_FORMAT['FILENAME'])
+        return date_obj.strftime(DATE_FORMAT['TRACKER'])
+    except (ValueError, StopIteration):
+        logger.warning(f"Could not extract date from filename: {filename}")
+        return None
+
 def get_data_files(blob_service_client, container_name: str, prefix: str, category_prefix: str, 
-                   data_extension: str) -> List[str]:
-    """Get list of data files (excluding CTL files) for a category."""
+                   data_extension: str, processing_date: str) -> List[str]:
+    """
+    Get list of data files for a specific date.
+    processing_date should be in TRACKER format.
+    """
     try:
         container_client = blob_service_client.get_container_client(container_name)
         full_prefix = prefix + category_prefix
         logger.info(f"Listing data files with prefix: {full_prefix}")
         
-        # List blobs and filter for data files
-        blobs = container_client.list_blobs(name_starts_with=full_prefix)
-        data_files = sorted([
-            blob.name for blob in blobs 
-            if blob.name.endswith(data_extension)
-        ])
+        # Convert processing_date from tracker format to filename format
+        date_obj = datetime.strptime(processing_date, DATE_FORMAT['TRACKER'])
+        date_for_file = date_obj.strftime(DATE_FORMAT['FILENAME'])
         
-        logger.info(f"Found {len(data_files)} data files")
-        logger.debug(f"Data files: {data_files}")
+        # List blobs and filter for specific date
+        blobs = container_client.list_blobs(name_starts_with=full_prefix)
+        data_files = []
+        
+        for blob in blobs:
+            if not blob.name.endswith(data_extension):
+                continue
+                
+            # Check if file matches the processing date
+            try:
+                filename = os.path.basename(blob.name)
+                date_str = next(part for part in filename.split('_') 
+                              if len(part) == 8 and part.isdigit())
+                if date_str == date_for_file:
+                    data_files.append(blob.name)
+            except (ValueError, StopIteration):
+                continue
+        
+        data_files.sort()
+        logger.info(f"Found {len(data_files)} data files for date {processing_date}")
         return data_files
+        
     except Exception as e:
         logger.error(f"Error listing data files: {str(e)}")
         raise
 
-def get_last_copied_file(blob_service_client, container_name: str, tracker_path: str, 
-                        category: str) -> Optional[str]:
-    """Get last copied file for a specific category."""
+def get_last_processed_date(tracker_content: dict) -> str:
+    """
+    Get the last processed date by checking all category files.
+    Returns the most recent date in TRACKER format.
+    """
+    last_dates = []
+    for category in FILE_CATEGORIES:
+        last_file = tracker_content.get(FILE_CATEGORIES[category]['tracker_key'])
+        if last_file:
+            date = extract_date_from_filename(last_file)
+            if date:
+                last_dates.append(date)
+    
+    return max(last_dates) if last_dates else None
+
+def get_next_processing_date(blob_service_client, container_name: str, tracker_path: str) -> str:
+    """
+    Determine the next date to process.
+    If no tracker exists, start with first phase's start date.
+    If tracker exists, get next date after last processed date.
+    Returns the next date to process in TRACKER format, or None if all phases complete.
+    """
     try:
         container_client = blob_service_client.get_container_client(container_name)
         blob_client = container_client.get_blob_client(tracker_path)
-        tracker_content = blob_client.download_blob().readall()
-        tracker_data = json.loads(tracker_content)
-        last_file = tracker_data.get(FILE_CATEGORIES[category]['tracker_key'])
-        logger.info(f"Last copied file for {category}: {last_file}")
-        return last_file
+        
+        try:
+            tracker_content = json.loads(blob_client.download_blob().readall())
+            last_processed_date = get_last_processed_date(tracker_content)
+            
+            if not last_processed_date:
+                # If no last processed date, start with first phase
+                logger.info(f"No last processed date found. Starting with phase 1: {PHASES[0]['start_date']}")
+                return PHASES[0]['start_date']
+                
+            # Find current phase based on last processed date
+            current_phase = None
+            next_phase = None
+            
+            for i, phase in enumerate(PHASES):
+                if phase['start_date'] <= last_processed_date <= phase['end_date']:
+                    current_phase = phase
+                    next_phase = PHASES[i + 1] if i + 1 < len(PHASES) else None
+                    break
+            
+            if not current_phase:
+                logger.error(f"Last processed date {last_processed_date} does not belong to any phase. "
+                           f"This might indicate data corruption. Starting from phase 1.")
+                return PHASES[0]['start_date']
+            
+            # Calculate next date
+            last_date = datetime.strptime(last_processed_date, DATE_FORMAT['TRACKER'])
+            next_date = last_date + timedelta(days=1)
+            next_date_str = next_date.strftime(DATE_FORMAT['TRACKER'])
+                
+            # If next_date is within current phase, continue with it
+            if next_date_str <= current_phase['end_date']:
+                logger.info(f"Processing next date {next_date_str} in phase {current_phase['id']}")
+                return next_date_str
+                
+            # If we've completed current phase and there's a next phase, 
+            # move to next phase's start date
+            if next_phase:
+                logger.info(f"Phase {current_phase['id']} completed on {last_processed_date}. "
+                          f"Moving to phase {next_phase['id']} starting from {next_phase['start_date']}")
+                return next_phase['start_date']
+            
+            # If we're here, we've completed all phases
+            logger.info(f"All phases completed! Last processed date was {last_processed_date}")
+            return None
+            
+        except Exception as e:
+            if "BlobNotFound" in str(e):
+                logger.info(f"No tracker found. Starting with phase 1: {PHASES[0]['start_date']}")
+                return PHASES[0]['start_date']
+            raise
+            
     except Exception as e:
-        if "BlobNotFound" in str(e):
-            logger.warning(f"No {tracker_path} found. Will start from beginning.")
-        else:
-            logger.error(f"Error reading tracker: {str(e)}")
-        return None
+        logger.error(f"Error determining next processing date: {str(e)}")
+        raise
 
 def update_tracker(blob_service_client, container_name: str, tracker_path: str,
                   category: str, copied_file: str):
-    """Update tracker for a specific category."""
+    """Update tracker with processed file information."""
     try:
         container_client = blob_service_client.get_container_client(container_name)
         blob_client = container_client.get_blob_client(tracker_path)
@@ -80,13 +204,21 @@ def update_tracker(blob_service_client, container_name: str, tracker_path: str,
         except Exception:
             tracker_content = {}
         
-        # Update tracker with new file and timestamp
+        # Update tracker
         tracker_content[FILE_CATEGORIES[category]['tracker_key']] = copied_file
         tracker_content['last_updated'] = datetime.utcnow().isoformat()
         
         # Upload updated tracker
         blob_client.upload_blob(json.dumps(tracker_content), overwrite=True)
-        logger.info(f"Updated tracker for {category} with file: {copied_file}")
+        
+        # Get current date and phase for logging
+        current_date = extract_date_from_filename(copied_file)
+        current_phase = next((phase for phase in PHASES 
+                            if phase['start_date'] <= current_date <= phase['end_date']), None)
+        phase_id = current_phase['id'] if current_phase else 'unknown'
+        
+        logger.info(f"Updated tracker for {category} with file: {copied_file} "
+                   f"(Phase {phase_id})")
     except Exception as e:
         logger.error(f"Error updating tracker: {str(e)}")
         raise
@@ -140,94 +272,89 @@ def copy_files(source_client: BlobServiceClient, target_client: BlobServiceClien
 
 def process_category(category: str, source_client: BlobServiceClient, target_client: BlobServiceClient,
                     source_container: str, target_container: str,
-                    source_folder: str, target_folder: str, tracker_path: str) -> bool:
-    """Process files for a single category."""
-    logger.info(f"Processing category: {category}")
+                    source_folder: str, target_folder: str, tracker_path: str, 
+                    processing_date: str) -> bool:
+    """Process files for a single category for specific date."""
+    # Find current phase for logging
+    current_phase = next((phase for phase in PHASES 
+                         if phase['start_date'] <= processing_date <= phase['end_date']), None)
+    phase_id = current_phase['id'] if current_phase else 'unknown'
+    
+    logger.info(f"Processing category: {category} for date: {processing_date} (Phase {phase_id})")
     config = FILE_CATEGORIES[category]
     
-    # Get list of data files
+    # Get list of data files for this date
     data_files = get_data_files(
-        source_client, 
+        source_client,
         source_container,
         source_folder,
         config['prefix'],
-        config['data_extension']
+        config['data_extension'],
+        processing_date
     )
     
     if not data_files:
-        logger.info(f"No files found for category {category}")
+        logger.info(f"No files found for category {category} on date {processing_date}")
         return False
     
-    # Get last copied file
-    last_copied = get_last_copied_file(
-        target_client,
-        target_container,
-        tracker_path,
-        category
-    )
-    
-    # Find next file to copy
-    next_file = None
-    if last_copied is None:
-        next_file = data_files[0]
-    else:
-        try:
-            last_index = data_files.index(last_copied)
-            if last_index + 1 < len(data_files):
-                next_file = data_files[last_index + 1]
-        except ValueError:
-            logger.warning(f"Last copied file not found in source. Starting from beginning.")
-            next_file = data_files[0]
-    
-    if next_file is None:
-        logger.info(f"No new files to copy for category {category}")
-        return False
-    
-    # Copy files and update tracker
-    if copy_files(
-        source_client, target_client,
-        source_container, target_container,
-        next_file, target_folder
-    ):
-        update_tracker(
+    # Process each file for this date
+    files_copied = False
+    for file in data_files:
+        logger.info(f"Copying file: {file}")
+        if copy_files(
+            source_client,
             target_client,
+            source_container,
             target_container,
-            tracker_path,
-            category,
-            next_file
-        )
-        return True
+            file,
+            target_folder
+        ):
+            update_tracker(
+                source_client,
+                source_container,
+                tracker_path,
+                category,
+                file
+            )
+            files_copied = True
     
-    return False
+    return files_copied
 
 def main():
+    """Main function to orchestrate the file copying process."""
     try:
-        logger.info("Starting blob copy process")
+        # Get configuration from environment variables
+        connection_string = os.getenv('AZURE_STORAGE_CONNECTION_STRING')
+        if not connection_string:
+            raise ValueError("AZURE_STORAGE_CONNECTION_STRING environment variable not set")
         
-        # Configuration
-        source_account_name = "your-source-account"
-        source_account_key = "your-source-key"
-        source_container = "source-container"
-        source_folder = "source-folder/"
+        source_container = os.getenv('SOURCE_CONTAINER')
+        target_container = os.getenv('TARGET_CONTAINER')
+        source_folder = os.getenv('SOURCE_FOLDER', '')
+        target_folder = os.getenv('TARGET_FOLDER', '')
+        tracker_path = os.getenv('TRACKER_PATH', 'copy_tracker.json')
         
-        target_account_name = "your-target-account"
-        target_account_key = "your-target-key"
-        target_container = "target-container"
-        target_folder = "target-folder/"
-        tracker_path = "stem/copy_tracker.json"
+        if not all([source_container, target_container]):
+            raise ValueError("Required environment variables not set")
         
-        # Create clients
-        source_client = BlobServiceClient(
-            account_url=f"https://{source_account_name}.blob.core.windows.net",
-            credential=source_account_key
-        )
+        # Create blob service clients
+        source_client = BlobServiceClient.from_connection_string(connection_string)
+        target_client = source_client  # Using same client for source and target
         
-        target_client = BlobServiceClient(
-            account_url=f"https://{target_account_name}.blob.core.windows.net",
-            credential=target_account_key
-        )
+        # Get the next date to process
+        processing_date = get_next_processing_date(source_client, source_container, tracker_path)
         
-        # Process each category
+        if not processing_date:
+            logger.info("All phases have been completed. No more dates to process.")
+            return
+            
+        # Find current phase for logging
+        current_phase = next((phase for phase in PHASES 
+                            if phase['start_date'] <= processing_date <= phase['end_date']), None)
+        phase_id = current_phase['id'] if current_phase else 'unknown'
+        logger.info(f"Processing data for date: {processing_date} (Phase {phase_id})")
+        
+        # Process each category for the current date
         files_copied = False
         for category in FILE_CATEGORIES:
             if process_category(
@@ -235,27 +362,27 @@ def main():
                 source_client, target_client,
                 source_container, target_container,
                 source_folder, target_folder,
-                tracker_path
+                tracker_path,
+                processing_date
             ):
                 files_copied = True
         
         if files_copied:
-            logger.info("Successfully copied files from one or more categories")
+            logger.info(f"Successfully copied files for date {processing_date}")
         else:
-            logger.info("No new files to copy in any category")
+            logger.info(f"No files to copy for date {processing_date}")
+            # Update tracker even if no files were copied to move to next date
+            update_tracker(
+                source_client,
+                source_container,
+                tracker_path,
+                "no_files",
+                ""
+            )
             
     except Exception as e:
-        logger.error("Blob copy process failed", exc_info=True)
+        logger.error(f"Error in main function: {str(e)}")
         raise
 
 if __name__ == "__main__":
-    """
-    Flow:
-        main
-            process_category
-                get_data_files
-                get_last_copied_file
-                copy_files
-                update_tracker
-    """
     main()
